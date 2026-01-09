@@ -1,6 +1,9 @@
 "use client";
 
 import React, { useRef, useState } from "react";
+import VisualiserCanvas from "@/components/VisualiserCanvas";
+import MicVisualiser from "@/components/MicVisualiser";
+
 
 export default function WmpShell() {
   const [activeControl, setActiveControl] = useState<
@@ -18,7 +21,6 @@ export default function WmpShell() {
     const rect = el.getBoundingClientRect();
     const x = Math.min(Math.max(clientX - rect.left, 0), rect.width);
     const v = rect.width === 0 ? 0 : x / rect.width;
-
     setVolume(v);
   }
 
@@ -52,13 +54,18 @@ export default function WmpShell() {
           <div className="h-full grid grid-cols-1 md:grid-cols-[1fr_340px] gap-4 p-4">
             {/* LEFT: Visualiser + controls */}
             <div className="h-full flex flex-col">
-              {/* Visualiser */}
+              {/* Visualiser (single container, correct sizing) */}
               <div className="flex-1 relative rounded-xl border border-pink-500/40 bg-black shadow-inner shadow-pink-500/10 overflow-hidden">
                 {/* glass highlight */}
                 <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-white/5 via-transparent to-transparent" />
 
-                <div className="h-full flex items-center justify-center text-zinc-300/80 text-sm relative">
-                  Visualiser Area (canvas goes here later)
+                {/* Canvas visualiser */}
+                <MicVisualiser />
+
+
+                {/* Overlay label */}
+                <div className="pointer-events-none absolute bottom-3 left-3 text-[11px] text-zinc-400">
+                  Visualiser: Bars (demo)
                 </div>
               </div>
 
@@ -149,7 +156,6 @@ export default function WmpShell() {
 
             {/* RIGHT: Now Playing */}
             <aside className="h-full rounded-xl border border-pink-500/30 bg-gradient-to-b from-zinc-950 to-zinc-900 shadow-inner overflow-hidden">
-              {/* Header */}
               <div className="p-3 bg-gradient-to-b from-pink-500/20 to-transparent border-b border-pink-500/20">
                 <div className="text-xs text-zinc-200">Now Playing</div>
               </div>
@@ -174,7 +180,6 @@ export default function WmpShell() {
                   00:00 / 00:00
                 </div>
 
-                {/* Sidebar panels */}
                 <div className="mt-4 rounded-md border border-white/10 bg-black/40 shadow-inner">
                   <div className="px-3 py-2 border-b border-white/10 text-xs font-semibold text-zinc-200">
                     Playlist

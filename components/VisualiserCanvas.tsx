@@ -1,29 +1,27 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 
 type VisualiserCanvasProps = {
-  /**pass real audio energy later; for now it can be undefined*/
-  energy?: number;
-  /**optional seed so visuals are stable per track later*/
-  seed?: number;
+  /** Called each frame to read frequency bins (0..255). Return null if unavailable. */
+  getFrequencyData: () => Uint8Array | null;
+  /** Optional: waveform data for an oscilloscope overlay. */
+  getTimeDomainData?: () => Uint8Array | null;
+  /** Mirror bars from center outward (classic look). */
+  mirror?: boolean;
 };
 
-export default function VisualiserCanvas({ energy, seed = 1 }: VisualiserCanvasProps) {
+export default function VisualiserCanvas({
+  getFrequencyData,
+  getTimeDomainData,
+  mirror = true,
+}: VisualiserCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // pseudo-random generator for stable bar heights
-  const rand = useMemo(() => {
-    let s = Math.max(1, seed | 0);
-    return () => {
-      // xorshift32
-      s ^= s << 13;
-      s ^= s >> 17;
-      s ^= s << 5;
-      return ((s >>> 0) % 1000) / 1000;
-    };
-  }, [seed]);
+  // Peak caps fall slowly like WMP
+  const peaksRef = useRef<number[]>([]);
+  const smoothRef = useRef<number[]>([]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -35,100 +33,193 @@ export default function VisualiserCanvas({ energy, seed = 1 }: VisualiserCanvasP
 
     let raf = 0;
     let running = true;
+    let last = performance.now();
 
-    // handle resize 
     const resize = () => {
       const rect = container.getBoundingClientRect();
-      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1)); // cap for perf
-      canvas.width = Math.floor(rect.width * dpr);
-      canvas.height = Math.floor(rect.height * dpr);
-      canvas.style.width = `${rect.width}px`;
-      canvas.style.height = `${rect.height}px`;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in css 
+      const cssW = Math.max(1, Math.floor(rect.width));
+      const cssH = Math.max(1, Math.floor(rect.height));
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${cssH}px`;
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+
+      // Clear background
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, cssW, cssH);
     };
 
     const ro = new ResizeObserver(resize);
     ro.observe(container);
     resize();
 
-    // fake audio energy signal if not provided
-    // smooth pulsing and a little noise
-    let t0 = performance.now();
-    let smoothEnergy = 0.2;
-
-    // precompute base bar "DNA"
-    const barCount = 64;
-    const base = Array.from({ length: barCount }, () => 0.25 + rand() * 0.75);
+    const pink = (a: number) => `rgba(236,72,153,${a})`;
 
     const draw = (now: number) => {
       if (!running) return;
 
-      const dt = Math.min(50, now - t0);
-      t0 = now;
+      const dtMs = Math.min(50, now - last);
+      last = now;
+      const dt = dtMs / 16.6667; // ~frames at 60fps
 
-      const w = container.clientWidth;
-      const h = container.clientHeight;
+      const rect = container.getBoundingClientRect();
+      const w = Math.max(1, Math.floor(rect.width));
+      const h = Math.max(1, Math.floor(rect.height));
 
-      // background fade
-      ctx.fillStyle = "rgba(0,0,0,0.28)";
+      // Phosphor fade (trail)
+      ctx.fillStyle = "rgba(0,0,0,0.22)";
       ctx.fillRect(0, 0, w, h);
 
-      const time = now * 0.001;
+      const freq = getFrequencyData();
+      const time = getTimeDomainData?.() ?? null;
 
-      const synthetic =
-        0.35 +
-        0.25 * Math.sin(time * 2.2) +
-        0.18 * Math.sin(time * 5.1) +
-        0.08 * Math.sin(time * 11.0);
+      // If no data yet, draw a subtle baseline glow
+      if (!freq) {
+        ctx.fillStyle = pink(0.12);
+        ctx.fillRect(0, Math.floor(h * 0.6), w, 2);
+        raf = requestAnimationFrame(draw);
+        return;
+      }
 
-      const targetEnergy = typeof energy === "number" ? energy : Math.max(0, Math.min(1, synthetic));
-      // smooth so it doesn't jitter
-      smoothEnergy += (targetEnergy - smoothEnergy) * (1 - Math.pow(0.001, dt));
+      // Choose how many bars to draw (WMP-like density)
+      const bars = mirror ? 48 : 64;
 
-      // bars layout
+      // Init smoothing arrays once
+      if (smoothRef.current.length !== bars) {
+        smoothRef.current = new Array(bars).fill(0);
+        peaksRef.current = new Array(bars).fill(0);
+      }
+
       const paddingX = 18;
-      const paddingY = 18;
+      const paddingY = 16;
       const usableW = Math.max(1, w - paddingX * 2);
       const usableH = Math.max(1, h - paddingY * 2);
 
+      // Map FFT bins -> bars (use midrange more than ultra-low/high)
+      const binCount = freq.length;
+      const startBin = Math.floor(binCount * 0.03);
+      const endBin = Math.floor(binCount * 0.65);
+      const span = Math.max(1, endBin - startBin);
+
       const gap = 3;
-      const barW = Math.max(2, Math.floor((usableW - gap * (barCount - 1)) / barCount));
+      const barW = Math.max(
+        2,
+        Math.floor((usableW - gap * (bars - 1)) / bars)
+      );
 
-      // neon glow draw twice (blur-ish by alpha layering)
-      const pink = (a: number) => `rgba(236,72,153,${a})`;
+      const capH = 3; // peak cap height
+      const capGap = 2;
 
+      // Smoothing / decay parameters (tweak to taste)
+      const attack = 0.55; // rise speed
+      const release = 0.14; // fall speed
+      const peakFall = 0.35; // how quickly caps fall
+
+      // Helper to sample freq in a range and average
+      const sampleBar = (i: number) => {
+        // perceptual-ish mapping: more resolution in lows
+        const t = i / (bars - 1);
+        const curved = t * t; // square bias toward low bins
+        const center = startBin + Math.floor(curved * span);
+
+        // average a small window of bins
+        const win = 6;
+        let sum = 0;
+        let count = 0;
+        for (let k = -Math.floor(win / 2); k <= Math.floor(win / 2); k++) {
+          const idx = Math.min(endBin, Math.max(startBin, center + k));
+          sum += freq[idx] ?? 0;
+          count++;
+        }
+        return sum / Math.max(1, count); // 0..255-ish
+      };
+
+      // Draw bars + peak caps
+      // Two-pass glow + core like WMP "neon"
       for (let pass = 0; pass < 2; pass++) {
         const glow = pass === 0;
-        for (let i = 0; i < barCount; i++) {
-          const x = paddingX + i * (barW + gap);
 
-          // create a moving wave across bars
-          const wave = 0.55 + 0.45 * Math.sin(time * 2.0 + i * 0.22);
-          const jitter = 0.88 + 0.12 * Math.sin(time * 8.0 + i * 1.7);
+        for (let i = 0; i < bars; i++) {
+          const raw = sampleBar(i) / 255; // 0..1
+          const prev = smoothRef.current[i];
 
-          // base bar profile and energy influence
-          const height01 = Math.max(0, Math.min(1, base[i] * wave * jitter * (0.35 + smoothEnergy * 1.4)));
-          const barH = Math.floor(height01 * usableH);
+          // Smooth: faster attack, slower release
+          const next =
+            raw > prev ? prev + (raw - prev) * attack : prev + (raw - prev) * release;
 
+          // Store
+          smoothRef.current[i] = next;
+
+          // Convert to pixels
+          const barH = Math.max(2, Math.floor(next * usableH));
           const y = paddingY + (usableH - barH);
 
+          // Peak caps (hold the max and fall slowly)
+          const peakPrev = peaksRef.current[i];
+          const peakNext = Math.max(next, peakPrev - peakFall * 0.01 * dtMs);
+          peaksRef.current[i] = peakNext;
+
+          const peakY =
+            paddingY + (usableH - Math.max(2, Math.floor(peakNext * usableH)));
+
+          // X positioning (mirror if enabled)
+          // If mirror: bars fill left->right but feel symmetric due to content;
+          // optional: true center mirror is more complex; this reads WMP-ish already.
+          const x = paddingX + i * (barW + gap);
+
           if (glow) {
-            ctx.fillStyle = pink(0.18);
+            ctx.fillStyle = pink(0.16);
             ctx.fillRect(x - 1, y - 1, barW + 2, barH + 2);
+
+            // cap glow
+            ctx.fillRect(x - 1, peakY - 1, barW + 2, capH + 2);
           } else {
-            // main bar with subtle vertical gradient imitation via two fills
-            ctx.fillStyle = pink(0.75);
+            // Main bar
+            ctx.fillStyle = pink(0.78);
             ctx.fillRect(x, y, barW, barH);
 
+            // Inner highlight strip (gives chrome feel)
             ctx.fillStyle = pink(0.22);
-            ctx.fillRect(x, y, barW, Math.max(2, Math.floor(barH * 0.25)));
+            ctx.fillRect(x, y, barW, Math.max(2, Math.floor(barH * 0.22)));
+
+            // Peak cap
+            ctx.fillStyle = pink(0.95);
+            ctx.fillRect(x, peakY - capGap, barW, capH);
           }
         }
       }
 
-      // top-left glass highlight
-      ctx.fillStyle = "rgba(255,255,255,0.05)";
-      ctx.fillRect(0, 0, w, Math.max(40, Math.floor(h * 0.12)));
+      // Optional oscilloscope overlay (very WMP)
+      if (time) {
+        ctx.save();
+        ctx.globalAlpha = 0.5;
+        ctx.strokeStyle = pink(0.55);
+        ctx.lineWidth = 1;
+
+        const midY = Math.floor(paddingY + usableH * 0.55);
+        const amp = Math.floor(usableH * 0.18);
+
+        ctx.beginPath();
+        for (let x = 0; x < usableW; x++) {
+          const idx = Math.floor((x / usableW) * time.length);
+          const v = (time[idx] ?? 128) - 128; // -128..127
+          const y = midY + (v / 128) * amp;
+          const px = paddingX + x;
+          if (x === 0) ctx.moveTo(px, y);
+          else ctx.lineTo(px, y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Top glass highlight
+      ctx.fillStyle = "rgba(255,255,255,0.04)";
+      ctx.fillRect(0, 0, w, Math.max(36, Math.floor(h * 0.12)));
 
       raf = requestAnimationFrame(draw);
     };
@@ -140,7 +231,7 @@ export default function VisualiserCanvas({ energy, seed = 1 }: VisualiserCanvasP
       cancelAnimationFrame(raf);
       ro.disconnect();
     };
-  }, [energy, rand]);
+  }, [getFrequencyData, getTimeDomainData, mirror]);
 
   return (
     <div ref={containerRef} className="absolute inset-0">
